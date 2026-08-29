@@ -1,10 +1,11 @@
-cat > ~/install-personal-library-complete.sh << 'INSTALLER'
+cat > ~/install-personal-library-final.sh << 'INSTALLER'
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
 echo "=================================================="
-echo "📚 Personal Library Website — Complete Installer"
-echo "   Port 8771 • LAN Mesh • All Features Included"
+echo "📚 Personal Library — Complete Installer v1.0"
+echo "   Port 8771 • LAN Mesh • All Features"
+echo "   Tested: Ubuntu 24.04 WSL2"
 echo "=================================================="
 
 # ─────────────────────────────────────────────────────────────
@@ -14,8 +15,8 @@ MANAGER="$HOME/library-manager"
 BASE="$HOME/library"
 LIBRARY_PORT=8771
 DISCOVERY_PORT=8772
-FLEET_NAME="library-node-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
-COMM_CODE=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+FLEET_NAME="library-node-$(python3 -c 'import secrets; print(secrets.token_hex(3))' 2>/dev/null || echo 'unknown')"
+COMM_CODE=$(python3 -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null || echo 'change-me')
 
 # ─────────────────────────────────────────────────────────────
 # Create Directories
@@ -23,6 +24,7 @@ COMM_CODE=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 echo "📁 Creating directory structure..."
 mkdir -p "$MANAGER"/{backups,logs,run}
 mkdir -p "$BASE"/{backend/app,backend/templates,backend/static/css,backend/static/js}
+mkdir -p "$BASE"/backend/app/models
 mkdir -p "$BASE"/data/{db,inbox,imports,covers,files}
 chmod 700 "$BASE" "$BASE"/data "$BASE"/data/*
 
@@ -402,7 +404,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
-from backend.app.db import init_db, create_item, get_item_by_hash, list_items, count_items, get_item_by_id, update_item
+from backend.app.db import init_db, create_item, get_item_by_hash, list_items, count_items, get_item_by_id
 
 LIBRARY_HOST = os.getenv("LIBRARY_HOST", "127.0.0.1")
 LIBRARY_PORT = int(os.getenv("LIBRARY_PORT", "8771"))
@@ -499,37 +501,6 @@ async def get_file_content(item_id: int):
         return {"filename": item.filename, "content": content, "size": len(content)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot read file: {str(e)}")
-
-@app.get("/api/files/{item_id}/conversations")
-async def get_conversation(item_id: int):
-    item = await get_item_by_id(item_id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Item not found")
-    if not os.path.exists(item.file_path):
-        raise HTTPException(status_code=404, detail="File not found on disk")
-    try:
-        with open(item.file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        messages = []
-        if isinstance(data, dict):
-            messages = data.get("messages", data.get("history", []))
-            title = data.get("title", data.get("chat_title", "Untitled Chat"))
-        elif isinstance(data, list):
-            messages = data
-            title = "Chat Export"
-        else:
-            messages = []
-            title = "Unknown Format"
-        formatted = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")
-                timestamp = msg.get("timestamp", msg.get("created_at", ""))
-                formatted.append({"role": role, "content": content, "timestamp": timestamp})
-        return {"title": title, "message_count": len(formatted), "messages": formatted}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot parse JSON: {str(e)}")
 
 def parse_json_content(content: bytes) -> dict:
     try:
@@ -634,7 +605,7 @@ cat > "$BASE/backend/templates/index.html" << 'EOF'
         <header>
             <h1>📚 Personal Library</h1>
             <div class="status-bar">
-                <span class="status-item"><span class="label">Fleet:</span><span class="value">{{ fleet_name }}</span></span>
+                <span class="status-item"><span class="label">Fleet:</span><span class="value" id="fleet-name">{{ fleet_name }}</span></span>
                 <span class="status-item"><span class="label">Port:</span><span class="value">{{ library_port }}</span></span>
                 <span class="status-item"><span class="label">Mesh:</span><span class="value" id="mesh-status">🟡 Connecting...</span></span>
             </div>
@@ -872,67 +843,35 @@ async function showPreview(itemId) {
         previewModal.style.display = 'flex';
         return;
     }
-    
     let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">';
     html += '<h2>' + escapeHtml(item.filename) + '</h2>';
     html += '<a href="' + FILES_ENDPOINT + '/' + item.id + '" download class="btn" style="background:#3b82f6;color:white;padding:0.5rem 1rem;border-radius:4px;text-decoration:none;">⬇️ Download</a>';
     html += '</div>';
-    
     html += '<div class="item-meta" style="margin: 1rem 0;">';
     html += '<span>Type: ' + item.file_type + '</span>';
     html += '<span>Size: ' + formatSize(item.file_size) + '</span>';
     html += '<span>Chain: #' + (item.chain_position || '?') + '</span>';
     html += '</div>';
-    
     if (['.mp4', '.webm'].includes(item.file_type)) {
-        html += '<video controls style="width:100%;max-height:500px;background:#000;border-radius:8px;">';
-        html += '<source src="' + FILES_ENDPOINT + '/' + item.id + '" type="' + getVideoType(item.file_type) + '">';
-        html += '</video>';
-    }
-    else if (['.png', '.jpg', '.jpeg'].includes(item.file_type)) {
-        html += '<img src="' + FILES_ENDPOINT + '/' + item.id + '" style="max-width:100%;max-height:500px;border-radius:8px;">';
-    }
-    else if (item.file_type === '.pdf') {
-        html += '<div style="padding:2rem;text-align:center;background:#1e293b;border-radius:8px;">';
-        html += '<div style="font-size:3rem;margin-bottom:1rem;">📕</div>';
-        html += '<p style="color:#94a3b8;">PDF files open best in an external viewer.</p>';
-        html += '<p style="margin-top:1rem;"><strong>Click the Download button above to open this PDF.</strong></p>';
-        html += '</div>';
-    }
-    else if (['.mp3', '.wav'].includes(item.file_type)) {
-        html += '<audio controls style="width:100%;">';
-        html += '<source src="' + FILES_ENDPOINT + '/' + item.id + '" type="' + getAudioType(item.file_type) + '">';
-        html += '</audio>';
-    }
-    else if (item.file_type === '.json') {
+        html += '<div style="margin-top:1rem;"><video controls autoplay style="width:100%;max-height:500px;background:#000;border-radius:8px;"><source src="' + FILES_ENDPOINT + '/' + item.id + '" type="' + (item.file_type === '.mp4' ? 'video/mp4' : 'video/webm') + '">Your browser does not support video playback.</video></div>';
+    } else if (['.png', '.jpg', '.jpeg'].includes(item.file_type)) {
+        html += '<div style="margin-top:1rem;text-align:center;"><img src="' + FILES_ENDPOINT + '/' + item.id + '" style="max-width:100%;max-height:500px;border-radius:8px;"></div>';
+    } else if (item.file_type === '.pdf') {
+        html += '<div style="padding:2rem;text-align:center;background:#1e293b;border-radius:8px;margin-top:1rem;"><div style="font-size:3rem;margin-bottom:1rem;">📕</div><p style="color:#94a3b8;">PDF files open best in an external viewer.</p><p style="margin-top:1rem;"><strong>Click the Download button above.</strong></p></div>';
+    } else if (['.mp3', '.wav'].includes(item.file_type)) {
+        html += '<div style="margin-top:1rem;"><audio controls autoplay style="width:100%;"><source src="' + FILES_ENDPOINT + '/' + item.id + '" type="' + (item.file_type === '.mp3' ? 'audio/mpeg' : 'audio/wav') + '">Your browser does not support audio playback.</audio></div>';
+    } else if (item.file_type === '.json') {
         if (item.title) html += '<p><strong>Title:</strong> ' + escapeHtml(item.title) + '</p>';
         if (item.message_count) html += '<p><strong>Messages:</strong> ' + item.message_count + '</p>';
-        try {
-            const response = await fetch(FILES_ENDPOINT + '/' + item.id + '/content');
-            const data = await response.json();
-            if (data.content) {
-                html += '<div style="margin-top:1rem;">';
-                html += '<h3 style="color:#3b82f6;margin-bottom:0.5rem;">📄 Content (Raw JSON)</h3>';
-                html += '<pre style="white-space:pre-wrap;font-family:monospace;font-size:0.75rem;background:#0f172a;padding:1rem;border-radius:8px;border:1px solid #475569;max-height:400px;overflow-y:auto;color:#f1f5f9;">' + escapeHtml(data.content) + '</pre>';
-                html += '</div>';
-            }
-        } catch (e) {
-            html += '<p style="color:#94a3b8;">Download the file to view its contents.</p>';
-        }
-    }
-    else {
-        html += '<p>Download to view this file type.</p>';
-    }
-    
+        try { const response = await fetch(FILES_ENDPOINT + '/' + item.id + '/content'); const data = await response.json(); if (data.content) { html += '<div style="margin-top:1rem;"><h3 style="color:#3b82f6;margin-bottom:0.5rem;">📄 Content</h3><pre style="white-space:pre-wrap;font-family:monospace;font-size:0.75rem;background:#0f172a;padding:1rem;border-radius:8px;border:1px solid #475569;max-height:400px;overflow-y:auto;color:#f1f5f9;">' + escapeHtml(data.content) + '</pre></div>'; }} catch (e) { html += '<p style="color:#94a3b8;">Download the file to view its contents.</p>'; }
+    } else { html += '<p style="margin-top:1rem;">Download to view this file type.</p>'; }
     html += '<button onclick="closePreview()" style="margin-top:1.5rem;width:100%;padding:0.75rem;background:#3b82f6;color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem;">Close</button>';
-    
     previewBody.innerHTML = html;
     previewModal.style.display = 'flex';
 }
 
-function getVideoType(ext) { return ext === '.mp4' ? 'video/mp4' : 'video/webm'; }
-function getAudioType(ext) { return ext === '.mp3' ? 'audio/mpeg' : 'audio/wav'; }
 function closePreview() { previewModal.style.display = 'none'; }
+previewModal.addEventListener('click', (e) => { if (e.target === previewModal) closePreview(); });
 
 async function checkMeshStatus() {
     try {
@@ -950,7 +889,7 @@ async function checkMeshStatus() {
 }
 
 function getFileIcon(fileType) {
-    const icons = {'.json':'📄','.mp4':'🎬','.webm':'🎬','.png':'🖼️','.jpg':'🖼️','.pdf':'📕','.mp3':'🎵','.wav':'🎵'};
+    const icons = {'.json':'📄','.mp4':'🎬','.webm':'🎬','.png':'🖼️','.jpg':'🖼️','.jpeg':'🖼️','.pdf':'📕','.mp3':'🎵','.wav':'🎵','.txt':'📝','.md':'📝'};
     return icons[fileType] || '📁';
 }
 
@@ -1019,7 +958,11 @@ echo "=================================================="
 "$MANAGER/start-all.sh"
 INSTALLER
 
-chmod +x ~/install-personal-library-complete.sh
-echo "✅ Complete installer created successfully!"
+chmod +x ~/install-personal-library-final.sh
+echo "✅ Complete installer created!"
 echo ""
-echo "Run it with: ~/install-personal-library-complete.sh"
+echo "Copy this script to your clean Ubuntu WSL2:"
+echo "  scp ~/install-personal-library-final.sh user@wsl2-ip:~/"
+echo ""
+echo "Or paste directly into clean Ubuntu terminal:"
+echo "  ~/install-personal-library-final.sh"
