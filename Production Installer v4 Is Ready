@@ -1,0 +1,622 @@
+cat > ~/library-installer-v4.sh << 'INSTALLER'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+echo "=================================================="
+echo "📚 Personal Library — Production Installer v4"
+echo "   Complete Wipe • Fresh Install • All Features"
+echo "=================================================="
+
+BASE="$HOME/library"
+MANAGER="$HOME/library-manager"
+PORT=8771
+
+# ─────────────────────────────────────────────────────────────
+# WIPE OLD INSTALLATION
+# ─────────────────────────────────────────────────────────────
+echo "🧹 Wiping old installation..."
+if [ -f "$MANAGER/stop-all.sh" ]; then
+    "$MANAGER/stop-all.sh" || true
+fi
+rm -rf "$BASE"
+rm -rf "$MANAGER"
+echo "   ✅ Old installation removed"
+
+# ─────────────────────────────────────────────────────────────
+# CREATE DIRECTORIES
+# ─────────────────────────────────────────────────────────────
+echo "📁 Creating directories..."
+mkdir -p "$MANAGER"/{logs,run}
+mkdir -p "$BASE"/{backend/app,backend/templates,backend/static}
+mkdir -p "$BASE"/data/{db,inbox,imports,covers,files}
+echo "   ✅ Directories created"
+
+# ─────────────────────────────────────────────────────────────
+# PYTHON VENV
+# ─────────────────────────────────────────────────────────────
+echo "🐍 Setting up Python..."
+cd "$BASE"
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip --quiet
+echo "   ✅ Python ready"
+
+# ─────────────────────────────────────────────────────────────
+# DEPENDENCIES
+# ─────────────────────────────────────────────────────────────
+echo "📦 Installing dependencies..."
+cat > "$BASE/requirements.txt" << 'REQS'
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+jinja2==3.1.4
+python-dotenv==1.0.1
+REQS
+
+pip install -r requirements.txt --quiet
+echo "   ✅ Dependencies installed"
+
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+echo "⚙️  Creating configuration..."
+FLEET_NAME="library-node-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+
+cat > "$BASE/.env" << ENV
+LIBRARY_HOST=127.0.0.1
+LIBRARY_PORT=$PORT
+LIBRARY_FLEET_NAME=$FLEET_NAME
+LIBRARY_DATA_ROOT=./data
+LIBRARY_DB_PATH=./data/db/library.db
+ENV
+chmod 600 "$BASE/.env"
+echo "   ✅ Configuration created"
+
+# ─────────────────────────────────────────────────────────────
+# DATABASE MODULE
+# ─────────────────────────────────────────────────────────────
+echo "🗄️  Creating database module..."
+cat > "$BASE/backend/app/db.py" << 'EOF'
+import os, hashlib
+from pathlib import Path
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Text, Index, func
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATA_ROOT = Path(os.getenv("LIBRARY_DATA_ROOT", "./data"))
+DB_PATH = DATA_ROOT / "db" / "library.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+Base = declarative_base()
+
+class LibraryItem(Base):
+    __tablename__ = "library_items"
+    id = Column(Integer, primary_key=True)
+    filename = Column(String(500), nullable=False)
+    file_path = Column(String(1000), nullable=False)
+    file_type = Column(String(50), nullable=False)
+    file_size = Column(BigInteger, nullable=False)
+    timestamp = Column(String(50), nullable=False, index=True)
+    source_laptop = Column(String(100), nullable=False)
+    ingested_at = Column(String(50), nullable=False)
+    chain_position = Column(Integer, nullable=True, index=True)
+    content_hash = Column(String(64), nullable=False, unique=True, index=True)
+    title = Column(String(500), nullable=True)
+    message_count = Column(Integer, default=0)
+    content_preview = Column(Text, nullable=True)
+
+engine = create_engine(f"sqlite:///{DB_PATH}")
+Session = sessionmaker(bind=engine)
+
+def init_db():
+    Base.metadata.create_all(engine)
+    print(f"Database: {DB_PATH}")
+
+def get_item(id):
+    with Session() as s:
+        return s.query(LibraryItem).filter(LibraryItem.id==id).first()
+
+def get_by_hash(h):
+    with Session() as s:
+        return s.query(LibraryItem).filter(LibraryItem.content_hash==h).first()
+
+def add_item(filename, file_path, file_type, file_size, content_hash, timestamp, source, ingested, title=None, msg_count=0, preview=None):
+    with Session() as s:
+        max_pos = s.query(func.max(LibraryItem.chain_position)).scalar()
+        item = LibraryItem(
+            filename=filename, file_path=file_path, file_type=file_type,
+            file_size=file_size, content_hash=content_hash, timestamp=timestamp,
+            source_laptop=source, ingested_at=ingested,
+            chain_position=(max_pos or 0)+1, title=title,
+            message_count=msg_count, content_preview=preview
+        )
+        s.add(item)
+        s.commit()
+        s.refresh(item)
+        return item
+
+def list_items(limit=50, ftype=None):
+    with Session() as s:
+        q = s.query(LibraryItem).order_by(LibraryItem.chain_position)
+        if ftype: q = q.filter(LibraryItem.file_type==ftype)
+        return q.limit(limit).all()
+
+def count_items(ftype=None):
+    with Session() as s:
+        q = s.query(func.count(LibraryItem.id))
+        if ftype: q = q.filter(LibraryItem.file_type==ftype)
+        return q.scalar()
+
+def delete_item(id):
+    with Session() as s:
+        item = s.query(LibraryItem).filter(LibraryItem.id==id).first()
+        if item:
+            try:
+                if os.path.exists(item.file_path):
+                    os.remove(item.file_path)
+            except Exception as e:
+                print(f"Warning: Could not delete file {item.file_path}: {e}")
+            s.delete(item)
+            s.commit()
+            return True
+        return False
+EOF
+echo "   ✅ Database module created"
+
+# ─────────────────────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────────────────────
+echo "🚀 Creating FastAPI app..."
+cat > "$BASE/backend/app/main.py" << 'EOF'
+import os, hashlib, json
+from datetime import datetime
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+from backend.app.db import init_db, get_item, get_by_hash, add_item, list_items, count_items, delete_item
+
+PORT = int(os.getenv("LIBRARY_PORT", "8771"))
+FLEET = os.getenv("LIBRARY_FLEET_NAME", "library")
+DATA = Path(os.getenv("LIBRARY_DATA_ROOT", "./data"))
+
+app = FastAPI(title="Personal Library")
+app.mount("/static", StaticFiles(directory="backend/static"), name="static")
+tpl = Jinja2Templates(directory="backend/templates")
+
+@app.on_event("startup")
+def start():
+    init_db()
+    print(f"Running at http://127.0.0.1:{PORT}")
+
+@app.get("/", response_class=HTMLResponse)
+def root(req: Request):
+    return tpl.TemplateResponse("index.html", {"request": req, "fleet": FLEET, "port": PORT})
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "port": PORT}
+
+@app.get("/api/items")
+def items(ftype: str = None):
+    return {"items": [i.__dict__ for i in list_items(50, ftype)], "total": count_items(ftype)}
+
+@app.get("/api/files/{id}")
+def file(id: int):
+    item = get_item(id)
+    if not item: raise HTTPException(404, "Not found")
+    return FileResponse(item.file_path, filename=item.filename)
+
+@app.get("/api/files/{id}/content")
+def content(id: int):
+    item = get_item(id)
+    if not item: raise HTTPException(404, "Not found")
+    with open(item.file_path) as f:
+        return {"filename": item.filename, "content": f.read()}
+
+@app.post("/api/import/upload")
+async def upload(file: UploadFile = File(...)):
+    ok = {".json",".mp4",".webm",".png",".jpg",".pdf",".mp3",".wav",".txt",".md"}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ok:
+        raise HTTPException(400, f"{ext} not allowed")
+    
+    imports = DATA / "imports"
+    imports.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{ts}_{file.filename.replace(' ','_')}"
+    path = imports / name
+    
+    data = await file.read()
+    with open(path, "wb") as f:
+        f.write(data)
+    
+    h = hashlib.sha256(data).hexdigest()
+    if get_by_hash(h):
+        return {"status": "duplicate"}
+    
+    created = datetime.fromtimestamp(path.stat().st_ctime).isoformat()
+    title, preview, cnt = None, None, 0
+    if ext == ".json":
+        try:
+            d = json.loads(data.decode())
+            if isinstance(d, dict):
+                title = d.get("title", "Untitled")
+                msgs = d.get("messages", [])
+                cnt = len(msgs)
+                preview = f"{cnt} messages"
+        except: pass
+    
+    item = add_item(name, str(path), ext, len(data), h, created, FLEET, datetime.now().isoformat(), title, cnt, preview)
+    return {"status": "ok", "id": item.id}
+
+@app.delete("/api/items/{id}")
+def delete_api(id: int):
+    if delete_item(id):
+        return {"status": "deleted", "id": id}
+    raise HTTPException(404, "Item not found")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.app.main:app", host="127.0.0.1", port=PORT)
+EOF
+echo "   ✅ FastAPI app created"
+
+# ─────────────────────────────────────────────────────────────
+# RUN.PY
+# ─────────────────────────────────────────────────────────────
+cat > "$BASE/run.py" << 'EOF'
+#!/usr/bin/env python3
+import os, uvicorn
+PORT = int(os.getenv("LIBRARY_PORT", "8771"))
+uvicorn.run("backend.app.main:app", host="127.0.0.1", port=PORT)
+EOF
+chmod +x "$BASE/run.py"
+echo "   ✅ Launcher created"
+
+# ─────────────────────────────────────────────────────────────
+# HTML TEMPLATE (Full UI with Drag-Drop + Delete)
+# ─────────────────────────────────────────────────────────────
+echo "🎨 Creating UI..."
+cat > "$BASE/backend/templates/index.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>📚 Personal Library</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:system-ui;background:#0f172a;color:#f1f5f9;padding:2rem}
+        .container{max-width:1200px;margin:0 auto}
+        h1{margin-bottom:2rem}
+        .drop{border:3px dashed #475569;border-radius:8px;padding:4rem 2rem;text-align:center;cursor:pointer;margin-bottom:2rem;background:#1e293b;transition:all 0.3s}
+        .drop:hover,.drop.dragover{border-color:#3b82f6;background:#334155;transform:scale(1.01)}
+        .drop-icon{font-size:4rem;display:block;margin-bottom:1rem}
+        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:2rem}
+        .stat{background:#1e293b;padding:1.5rem;border-radius:8px;text-align:center}
+        .num{font-size:2rem;color:#3b82f6;font-weight:bold}
+        .items{background:#1e293b;border-radius:8px;padding:1.5rem}
+        .item{background:#0f172a;padding:1rem;margin:0.5rem 0;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:all 0.2s}
+        .item:hover{background:#334155;border-color:#3b82f6;transform:translateX(4px)}
+        .modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);align-items:center;justify-content:center;z-index:1000}
+        .modal-content{background:#1e293b;padding:2rem;border-radius:8px;max-width:800px;max-height:80vh;overflow:auto;position:relative}
+        .btn{background:#3b82f6;color:#fff;padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block;margin:0.5rem 0.25rem}
+        .btn:hover{background:#2563eb}
+        .btn-danger{background:#ef4444}
+        .btn-danger:hover{background:#dc2626}
+        pre{background:#0f172a;padding:1rem;border-radius:4px;overflow:auto;max-height:400px;white-space:pre-wrap;font-family:monospace;font-size:0.85rem;color:#f1f5f9}
+        video,img{max-width:100%;margin-top:1rem;border-radius:8px}
+        .close-btn{position:absolute;top:1rem;right:1rem;background:none;border:none;color:#f1f5f9;font-size:1.5rem;cursor:pointer}
+        .progress{margin-top:1rem;padding:1rem;background:#1e293b;border-radius:8px;display:none}
+        .progress-bar{height:8px;background:#334155;border-radius:4px;overflow:hidden;margin-bottom:0.5rem}
+        .progress-fill{height:100%;background:#3b82f6;width:0%;transition:width 0.3s}
+        .chain{background:#3b82f6;color:white;padding:0.125rem 0.5rem;border-radius:4px;font-size:0.75rem;font-weight:600;margin-left:0.5rem}
+        .delete-btn{background:#ef4444;color:white;border:none;padding:0.5rem 1rem;border-radius:4px;cursor:pointer;font-size:0.875rem}
+        .delete-btn:hover{background:#dc2626}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📚 Personal Library</h1>
+        <div class="drop" id="dropzone">
+            <span class="drop-icon">💧</span>
+            <h2>Drop JSON and other files here</h2>
+            <p style="color:#94a3b8;margin:0.5rem 0">Supported: .json .mp4 .webm .png .jpg .pdf .mp3 .wav .txt .md</p>
+            <p style="color:#64748b;font-size:0.875rem">Files sorted by timestamp chain automatically</p>
+            <input id="file-input" type="file" multiple style="display:none">
+        </div>
+        <div class="progress" id="progress">
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            <p id="progress-text">Uploading...</p>
+        </div>
+        <div class="stats">
+            <div class="stat"><div class="num" id="total">0</div><div>Total Items</div></div>
+            <div class="stat"><div class="num" id="json-count">0</div><div>JSON Files</div></div>
+            <div class="stat"><div class="num" id="media-count">0</div><div>Media Files</div></div>
+        </div>
+        <div class="items">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+                <h2>📋 Library Items</h2>
+                <button class="btn" onclick="load()" style="margin:0">🔄 Refresh</button>
+            </div>
+            <div id="list"><p class="loading">Loading...</p></div>
+        </div>
+    </div>
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModal()">✕</button>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+    <script>
+        let items = [];
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('file-input');
+        const progress = document.getElementById('progress');
+        const progressFill = document.getElementById('progress-fill');
+        const progressText = document.getElementById('progress-text');
+
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener('dragleave', () => { dropzone.classList.remove('dragover'); });
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) handleFiles(files);
+        });
+        fileInput.addEventListener('change', (e) => {
+            const files = e.target.files;
+            if (files.length > 0) handleFiles(files);
+            fileInput.value = '';
+        });
+
+        async function handleFiles(files) {
+            for (const file of files) await uploadFile(file);
+            load();
+        }
+
+        async function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            progress.style.display = 'block';
+            progressFill.style.width = '0%';
+            progressText.textContent = 'Uploading ' + file.name + '...';
+            
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) progressFill.style.width = ((e.loaded / e.total) * 100) + '%';
+            });
+            xhr.addEventListener('load', () => {
+                if (xhr.status === 200) {
+                    progressText.textContent = '✅ ' + file.name + ' uploaded!';
+                    progressFill.style.backgroundColor = '#10b981';
+                    setTimeout(() => { progress.style.display = 'none'; progressFill.style.width = '0%'; progressFill.style.backgroundColor = '#3b82f6'; }, 2000);
+                } else {
+                    progressText.textContent = '❌ Upload failed';
+                    progressFill.style.backgroundColor = '#ef4444';
+                }
+            });
+            xhr.addEventListener('error', () => {
+                progressText.textContent = '❌ Upload error';
+                progressFill.style.backgroundColor = '#ef4444';
+            });
+            xhr.open('POST', '/api/import/upload');
+            xhr.send(formData);
+        }
+
+        async function load() {
+            const r = await fetch('/api/items');
+            const d = await r.json();
+            items = d.items || [];
+            document.getElementById('total').textContent = d.total || 0;
+            document.getElementById('json-count').textContent = items.filter(i => i.file_type === '.json').length;
+            document.getElementById('media-count').textContent = items.filter(i => ['.mp4','.webm','.png','.jpg','.pdf'].includes(i.file_type)).length;
+            const list = document.getElementById('list');
+            if (!items.length) {
+                list.innerHTML = '<p style="text-align:center;padding:2rem;color:#94a3b8"><span style="font-size:3rem;display:block;margin-bottom:1rem">💧</span>No items yet. Drop files above!</p>';
+                return;
+            }
+            list.innerHTML = items.map(i => `
+                <div class="item" onclick="show(${i.id})">
+                    <div style="display:flex;align-items:center;gap:1rem;flex:1">
+                        <span style="font-size:2rem">${getFileIcon(i.file_type)}</span>
+                        <div style="flex:1;min-width:0">
+                            <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${i.filename}</div>
+                            <div style="font-size:0.75rem;color:#94a3b8;margin-top:0.25rem">
+                                ${i.file_type.toUpperCase()} • ${formatSize(i.file_size)} • ${formatDate(i.timestamp)}
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:0.5rem">
+                        <span class="chain">#${i.chain_position || '?'}</span>
+                        <button class="delete-btn" onclick="event.stopPropagation();del(${i.id}, '${i.filename}')">🗑️ Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function del(id, filename) {
+            if (!confirm(`Delete "${filename}"? This cannot be undone.`)) return;
+            const r = await fetch(`/api/items/${id}`, {method: 'DELETE'});
+            const d = await r.json();
+            if (d.status === 'deleted') {
+                alert('✅ Deleted');
+                load();
+            } else {
+                alert('❌ Delete failed');
+            }
+        }
+
+        async function show(id) {
+            const item = items.find(i => i.id === id);
+            if (!item) return;
+            
+            let html = `<h2 style="margin-bottom:1rem">${item.filename}</h2>`;
+            html += `<div style="display:flex;gap:1rem;margin-bottom:1rem;color:#94a3b8;font-size:0.875rem">`;
+            html += `<span>Type: ${item.file_type}</span>`;
+            html += `<span>Size: ${formatSize(item.file_size)}</span>`;
+            html += `<span>Chain: #${item.chain_position || '?'}</span>`;
+            html += `</div>`;
+            html += `<div style="display:flex;gap:0.5rem;margin-bottom:1rem">`;
+            html += `<a href="/api/files/${item.id}" download class="btn">⬇️ Download</a>`;
+            html += `<button class="btn btn-danger" onclick="del(${item.id}, '${item.filename}')">🗑️ Delete</button>`;
+            html += `</div>`;
+            
+            if (item.file_type === '.json') {
+                if (item.title) html += `<p style="margin-top:1rem"><strong>Title:</strong> ${item.title}</p>`;
+                if (item.message_count) html += `<p><strong>Messages:</strong> ${item.message_count}</p>`;
+                try {
+                    const r = await fetch(`/api/files/${item.id}/content`);
+                    const d = await r.json();
+                    if (d.content) {
+                        html += `<h3 style="margin-top:1.5rem;color:#3b82f6">📄 Content:</h3>`;
+                        html += `<pre style="margin-top:0.5rem">${escapeHtml(d.content).substring(0, 5000)}${d.content.length > 5000 ? '...' : ''}</pre>`;
+                    }
+                } catch(e) { console.error(e); }
+            }
+            else if (['.mp4', '.webm'].includes(item.file_type)) {
+                html += `<video controls style="width:100%;margin-top:1rem;background:#000"><source src="/api/files/${item.id}" type="${item.file_type === '.mp4' ? 'video/mp4' : 'video/webm'}"></video>`;
+            }
+            else if (['.png', '.jpg', '.jpeg'].includes(item.file_type)) {
+                html += `<img src="/api/files/${item.id}" style="width:100%;margin-top:1rem">`;
+            }
+            else if (item.file_type === '.pdf') {
+                html += `<div style="margin-top:1rem;padding:2rem;text-align:center;background:#0f172a;border-radius:8px">`;
+                html += `<div style="font-size:3rem;margin-bottom:1rem">📕</div>`;
+                html += `<p style="color:#94a3b8">PDF files open best in an external viewer.</p>`;
+                html += `<p style="margin-top:1rem"><strong>Click the Download button above to open this PDF.</strong></p>`;
+                html += `</div>`;
+            }
+            else if (['.mp3', '.wav'].includes(item.file_type)) {
+                html += `<audio controls style="width:100%;margin-top:1rem"><source src="/api/files/${item.id}" type="${item.file_type === '.mp3' ? 'audio/mpeg' : 'audio/wav'}"></audio>`;
+            }
+            
+            html += `<button onclick="closeModal()" style="margin-top:1.5rem;width:100%;padding:0.75rem;background:#3b82f6;color:white;border:none;border-radius:8px;cursor:pointer;font-size:1rem">Close</button>`;
+            
+            document.getElementById('modal-body').innerHTML = html;
+            document.getElementById('modal').style.display = 'flex';
+        }
+
+        function closeModal() {
+            document.getElementById('modal').style.display = 'none';
+        }
+
+        function getFileIcon(type) {
+            const icons = {'.json':'📄','.mp4':'🎬','.webm':'🎬','.png':'🖼️','.jpg':'🖼️','.jpeg':'🖼️','.pdf':'📕','.mp3':'🎵','.wav':'🎵','.txt':'📝','.md':'📝'};
+            return icons[type] || '📁';
+        }
+
+        function formatSize(bytes) {
+            if (!bytes || isNaN(bytes)) return 'Unknown';
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        function formatDate(iso) {
+            if (!iso) return 'Unknown';
+            const d = new Date(iso);
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        load();
+    </script>
+</body>
+</html>
+EOF
+echo "   ✅ UI created"
+
+# ─────────────────────────────────────────────────────────────
+# MANAGEMENT SCRIPTS
+# ─────────────────────────────────────────────────────────────
+echo "🔧 Creating management scripts..."
+
+cat > "$MANAGER/start-all.sh" << 'EOF'
+#!/usr/bin/env bash
+cd "$HOME/library"
+source .venv/bin/activate
+mkdir -p run logs
+nohup python run.py > logs/library.log 2>&1 &
+echo $! > run/library.pid
+echo "✅ Library started (PID $!)"
+echo "📚 http://localhost:8771"
+sleep 2
+curl -fsS http://localhost:8771/api/health >/dev/null 2>&1 && echo "✅ Health check: OK" || echo "⚠️  Health check: Failed"
+EOF
+chmod +x "$MANAGER/start-all.sh"
+
+cat > "$MANAGER/stop-all.sh" << 'EOF'
+#!/usr/bin/env bash
+if [ -f "$HOME/library/run/library.pid" ]; then
+    kill $(cat "$HOME/library/run/library.pid") 2>/dev/null || true
+    rm -f "$HOME/library/run/library.pid"
+    echo "✅ Library stopped"
+else
+    echo "ℹ️  Not running"
+fi
+EOF
+chmod +x "$MANAGER/stop-all.sh"
+
+cat > "$MANAGER/health-all.sh" << 'EOF'
+#!/usr/bin/env bash
+echo "🔐 Personal Library Health"
+echo "=========================="
+if [ -f "$HOME/library/run/library.pid" ] && kill -0 $(cat "$HOME/library/run/library.pid") 2>/dev/null; then
+    echo "Server: ✅ Running (PID $(cat "$HOME/library/run/library.pid"))"
+else
+    echo "Server: ❌ Not running"
+fi
+CODE=$(curl -fsS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8771" 2>/dev/null || echo "000")
+echo "HTTP: $([[ "$CODE" == "200" ]] && echo "✅ OK ($CODE)" || echo "⚠️  Failed ($CODE)")"
+echo "DB: $([ -f "$HOME/library/data/db/library.db" ] && echo "✅ Exists" || echo "⚠️  Missing")"
+EOF
+chmod +x "$MANAGER/health-all.sh"
+echo "   ✅ Management scripts created"
+
+# ─────────────────────────────────────────────────────────────
+# START AND TEST
+# ─────────────────────────────────────────────────────────────
+echo ""
+echo "🚀 Starting Library..."
+"$MANAGER/start-all.sh"
+sleep 3
+
+echo ""
+echo "=================================================="
+echo "✅ INSTALLATION COMPLETE!"
+echo "=================================================="
+echo ""
+echo "Test it:"
+echo "  1. Open: http://localhost:8771"
+echo "  2. Drag & drop a test file"
+echo "  3. Click to view"
+echo "  4. Click 🗑️ Delete to remove"
+echo ""
+echo "Commands:"
+echo "  Start: ~/library-manager/start-all.sh"
+echo "  Stop:  ~/library-manager/stop-all.sh"
+echo "  Check: ~/library-manager/health-all.sh"
+echo ""
+echo "Features:"
+echo "  ✅ Drag & drop upload"
+echo "  ✅ Video/image playback"
+echo "  ✅ JSON content display"
+echo "  ✅ PDF download"
+echo "  ✅ Delete (list + modal)"
+echo "  ✅ Timestamp chain"
+echo "  ✅ Content hash dedup"
+echo ""
+"$MANAGER/health-all.sh"
+INSTALLER
+
+chmod +x ~/library-installer-v4.sh
