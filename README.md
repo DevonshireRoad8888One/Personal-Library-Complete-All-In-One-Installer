@@ -1,5 +1,10 @@
 # Personal-Library-Complete-All-In-One-Installer
 Personal Library — Complete All-In-One Installer
+
+ Run this line twice if servers are slow in starting all 7 Servers, you will get all greens on the second paste.
+ 
+ ~/openwebui-manager/start-all.sh && ~/library-manager/start-all.sh && ~/openwebui-manager/health-all.sh ~/openwebui-manager/health-all.sh && ~/openwebui-manager/health-all.sh &&  ~/library-manager/health-all.sh && ~/openwebui-manager/health-all.sh &&  ~/library-manager/health-all.sh && ~/library-manager/health-all.sh && ~/library-manager/health-all.sh
+
 🎉 v11.7a Changelog
 FEATURE
 STATUS
